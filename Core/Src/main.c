@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "stdio.h"
+#include <inttypes.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define HWT906_ADDR     (0x50 << 1) // I2C 从机地址（7位地址 0x50 左移一位）
+#define REG_ACC_Z_LOW   0x36        // Z轴加速度数据寄存器（低8位）
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -40,12 +42,17 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+DAC_HandleTypeDef hdac;
+
 I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+uint8_t z_data[2];      // 存放 I2C 读取的 2 个原始字节
+short z_raw;            // 合成后的 16 位整数
+float z_acc_g;          // 最终的加速度值 (g)
+uint32_t dac_val;       // 映射后的 DAC 数值 (0-4095)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -53,13 +60,18 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_DAC_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+// 将 printf 重定向到串口 2 (huart2)，以便在电脑上查看
+int __io_putchar(int ch) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 0xFFFF);
+    return ch;
+}
 /* USER CODE END 0 */
 
 /**
@@ -93,14 +105,43 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
+  MX_DAC_Init();
   /* USER CODE BEGIN 2 */
-
+HAL_DAC_Start(&hdac, DAC_CHANNEL_1); 
+printf("I2C Device Ready. \r\n"); // 这是你看到的最后一行
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   { 
+    // 1. 从寄存器 0x36 开始读取 2 个字节 (Z轴加速度)
+    if (HAL_I2C_Mem_Read(&hi2c1, (0x50 << 1), 0x36, I2C_MEMADD_SIZE_8BIT, z_data, 2, 100) == HAL_OK) 
+    {
+        // 2. 合成数据 (小端模式：低位在前)
+        z_raw = (short)(z_data[1] << 8 | z_data[0]);
+        
+        // 3. 转换为 g 值 (量程 ±16g，对应比例 32768)
+        z_acc_g = (float)z_raw / 32768.0f * 16.0f;
+
+        // 4. 映射到 DAC (假设 4-20mA 对应 -16g 到 +16g)
+        // 计算公式：将 -16~+16 线性映射到 0~4095
+        float temp = (z_acc_g + 16.0f) / 32.0f * 4095.0f;
+        
+        // 限幅保护
+        if(temp > 4095.0f) temp = 4095.0f;
+        if(temp < 0.0f)    temp = 0.0f;
+        
+        dac_val = (uint32_t)temp;
+
+        // 5. 更新 DAC 输出到 PA4
+        HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_val);
+
+        // 6. 串口打印观察结果
+        printf("Z_Acc: %.2f g | DAC: %" PRIu32 " \r\n", z_acc_g, dac_val);
+    }
+    
+    HAL_Delay(100); // 每秒更新 10 次
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -153,6 +194,46 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief DAC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DAC_Init(void)
+{
+
+  /* USER CODE BEGIN DAC_Init 0 */
+
+  /* USER CODE END DAC_Init 0 */
+
+  DAC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN DAC_Init 1 */
+
+  /* USER CODE END DAC_Init 1 */
+
+  /** DAC Initialization
+  */
+  hdac.Instance = DAC;
+  if (HAL_DAC_Init(&hdac) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** DAC channel OUT1 config
+  */
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  if (HAL_DAC_ConfigChannel(&hdac, &sConfig, DAC_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC_Init 2 */
+
+  /* USER CODE END DAC_Init 2 */
+
 }
 
 /**
