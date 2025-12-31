@@ -115,33 +115,41 @@ printf("I2C Device Ready. \r\n"); // 这是你看到的最后一行
   /* USER CODE BEGIN WHILE */
   while (1)
   { 
-    // 1. 从寄存器 0x36 开始读取 2 个字节 (Z轴加速度)
+    // 1. 读取数据
+    // 通过 I2C 读取 Z 轴原始字节
     if (HAL_I2C_Mem_Read(&hi2c1, (0x50 << 1), 0x36, I2C_MEMADD_SIZE_8BIT, z_data, 2, 100) == HAL_OK) 
     {
-        // 2. 合成数据 (小端模式：低位在前)
-        z_raw = (short)(z_data[1] << 8 | z_data[0]);
-        
-        // 3. 转换为 g 值 (量程 ±16g，对应比例 32768)
-        z_acc_g = (float)z_raw / 32768.0f * 16.0f;
+      // 按小端序合成为 16 位有符号数
+      z_raw = (short)(z_data[1] << 8 | z_data[0]);
+      // 假设使用 ±1.5g 硬件量程
+      // 按 ±1.5g 满量程换算为 g
+      z_acc_g = (float)z_raw / 32768.0f * 1.5f;
 
-        // 4. 映射到 DAC (假设 4-20mA 对应 -16g 到 +16g)
-        // 计算公式：将 -16~+16 线性映射到 0~4095
-        float temp = (z_acc_g + 16.0f) / 32.0f * 4095.0f;
-        
-        // 限幅保护
-        if(temp > 4095.0f) temp = 4095.0f;
-        if(temp < 0.0f)    temp = 0.0f;
-        
-        dac_val = (uint32_t)temp;
+      // 2. 映射 DAC (使用我们之前讨论的灵敏度放大公式)
+      // 将 [-1.5g, +1.5g] 映射到 12 位 DAC 范围
+      float temp = (z_acc_g + 1.5f) / 3.0f * 4095.0f;
+      // 限幅到有效 DAC 范围
+      if(temp > 4095.0f) temp = 4095.0f;
+      if(temp < 0.0f)    temp = 0.0f;
+      dac_val = (uint32_t)temp;
 
-        // 5. 更新 DAC 输出到 PA4
-        HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_val);
+      // 3. 执行输出（确保 hdac 和 CHANNEL_1 正确）
+      // 更新 DAC 输出寄存器（通道 1）
+      HAL_StatusTypeDef dac_status = HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_val);
 
-        // 6. 串口打印观察结果
-        printf("Z_Acc: %.2f g | DAC: %" PRIu32 " \r\n", z_acc_g, dac_val);
+      // 4. 打印调试：通过串口看 dac_val 是不是一直在变
+      // 调试打印：加速度(g)、加速度(m/s^2)、DAC 寄存器值、等效电压
+      if(dac_status == HAL_OK) {
+        float z_acc_ms2 = z_acc_g * 9.80665f;
+        printf("Z:%.2f g | Z:%.2f m/s^2 | DAC_Reg:%" PRIu32 " | Volt:%.2f V\r\n",
+               z_acc_g, z_acc_ms2, dac_val, (temp/4095.0f)*3.3f);
+      }
     }
-    
-    HAL_Delay(100); // 每秒更新 10 次
+    else {
+      printf("I2C Read Failed in Loop!\r\n");
+    }
+
+    HAL_Delay(100);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
