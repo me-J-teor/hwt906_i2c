@@ -51,8 +51,12 @@ UART_HandleTypeDef huart2;
 /* USER CODE BEGIN PV */
 uint8_t z_data[2];      // 存放 I2C 读取的 2 个原始字节
 short z_raw;            // 合成后的 16 位整数
-float z_acc_g;          // 最终的加速度值 (g)
+float z_acc_g;          // 最终处理后的加速度值 (g)
 uint32_t dac_val;       // 映射后的 DAC 数值 (0-4095)
+
+// --- 电梯应用新增变量 ---
+float z_offset = 0.0f;  // 存储电梯静止时的重力偏移量，用于“归零”
+float range_g = 0.5f;   // 监控的加速度量程（±0.5g 对应 4-20mA）
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -107,49 +111,57 @@ int main(void)
   MX_I2C1_Init();
   MX_DAC_Init();
   /* USER CODE BEGIN 2 */
-HAL_DAC_Start(&hdac, DAC_CHANNEL_1); 
-printf("I2C Device Ready. \r\n"); // 这是你看到的最后一行
+  HAL_DAC_Start(&hdac, DAC_CHANNEL_1); // 开启 DAC 通道 1
+  printf("Elevator Monitor Ready. Press B1 to Zero.\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   { 
-    // 1. 读取数据
-    // 通过 I2C 读取 Z 轴原始字节
-    if (HAL_I2C_Mem_Read(&hi2c1, (0x50 << 1), 0x36, I2C_MEMADD_SIZE_8BIT, z_data, 2, 100) == HAL_OK) 
+    // 1. 一键校准功能：如果电梯静止时不是0g，按下蓝色按钮归零
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) 
     {
-      // 按小端序合成为 16 位有符号数
-      z_raw = (short)(z_data[1] << 8 | z_data[0]);
-      // 假设使用 ±1.5g 硬件量程
-      // 按 ±1.5g 满量程换算为 g
-      z_acc_g = (float)z_raw / 32768.0f * 1.5f;
-
-      // 2. 映射 DAC (使用我们之前讨论的灵敏度放大公式)
-      // 将 [-1.5g, +1.5g] 映射到 12 位 DAC 范围
-      float temp = (z_acc_g + 1.5f) / 3.0f * 4095.0f;
-      // 限幅到有效 DAC 范围
-      if(temp > 4095.0f) temp = 4095.0f;
-      if(temp < 0.0f)    temp = 0.0f;
-      dac_val = (uint32_t)temp;
-
-      // 3. 执行输出（确保 hdac 和 CHANNEL_1 正确）
-      // 更新 DAC 输出寄存器（通道 1）
-      HAL_StatusTypeDef dac_status = HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_val);
-
-      // 4. 打印调试：通过串口看 dac_val 是不是一直在变
-      // 调试打印：加速度(g)、加速度(m/s^2)、DAC 寄存器值、等效电压
-      if(dac_status == HAL_OK) {
-        float z_acc_ms2 = z_acc_g * 9.80665f;
-        printf("Z:%.2f g | Z:%.2f m/s^2 | DAC_Reg:%" PRIu32 " | Volt:%.2f V\r\n",
-               z_acc_g, z_acc_ms2, dac_val, (temp/4095.0f)*3.3f);
-      }
-    }
-    else {
-      printf("I2C Read Failed in Loop!\r\n");
+        z_offset = (float)z_raw / 32768.0f * 16.0f; // 假设硬件量程为16g
+        printf(">>>> 已校准：当前重力状态设为 0点 <<<<\r\n");
+        HAL_Delay(500); 
     }
 
-    HAL_Delay(100);
+    // 2. 读取 HWT906 原始数据
+    if (HAL_I2C_Mem_Read(&hi2c1, HWT906_ADDR, REG_ACC_Z_LOW, I2C_MEMADD_SIZE_8BIT, z_data, 2, 100) == HAL_OK) 
+    {
+        // 合成原始数据
+        z_raw = (short)(z_data[1] << 8 | z_data[0]);
+        
+        // 换算加速度 (g)，减去校准偏移量
+        // 建议使用 16.0f，因为 HWT906 默认通常是 16g 量程
+        z_acc_g = ((float)z_raw / 32768.0f * 16.0f) - z_offset;
+
+        // 3. 映射到 DAC (4-20mA)
+        // 设定监控范围：假设电梯我们关心的是 ±0.5g 范围内的振动
+        // -0.5g -> 0 (4mA) | 0g -> 2048 (12mA) | +0.5g -> 4095 (20mA)
+        float range = 0.5f; 
+        float temp = (z_acc_g + range) / (2.0f * range) * 4095.0f;
+
+        // 限幅保护
+        if(temp > 4095.0f) temp = 4095.0f;
+        if(temp < 0.0f)    temp = 0.0f;
+        
+        dac_val = (uint32_t)temp;
+
+        // 4. 执行输出
+        HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_val);
+
+        // 5. 打印调试信息
+        printf("Acc:%.3fg | DAC:%" PRIu32 " | Est_Curr:%.2fmA\r\n", 
+                z_acc_g, dac_val, 4.0f + (temp/4095.0f)*16.0f);
+    }
+    else 
+    {
+        printf("I2C Error!\r\n");
+    }
+
+    HAL_Delay(20); // 将延迟减小到20ms，提高电梯振动监测的灵敏度
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
